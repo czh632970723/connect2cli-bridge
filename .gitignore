@@ -16,4 +16,5 @@ chatfile/
 .session-locks/
 .session-registry/
 .scheduled-messages/
+plugins/
 workspace/

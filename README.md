@@ -2,6 +2,8 @@
 
 企业微信智能机器人与 `codex` CLI 之间的纯 Python 会话桥接服务。
 
+English overview: [README.en.md](README.en.md)
+
 这是一个无前端的 headless 服务，负责：
 
 - 维护企业微信 WebSocket 长连
@@ -370,8 +372,12 @@ sh ./test.sh
 
 ## 相关文档
 
+- [README.en.md](README.en.md)
+  英文版入口文档
 - [使用手册](docs/使用手册.md)
   更完整的部署、API、排障说明
+- [Feature Guide](docs/FEATURES.md)
+  特性说明与能力边界
 - [cron 周期调度设计](docs/cron-periodic-scheduler-design.md)
   当前周期调度实现与后续演进设计
 
