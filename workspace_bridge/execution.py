@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
+from dataclasses import replace
 
 from .prompting import build_prompt
 from .reply_state import cache_reply_payload, cleanup_reply_state, get_or_create_reply_state, mark_reply_sent
 from .runner import build_runner_invocation, run_invocation
-from .runtime import prepare_session_run
-from .wecom_protocol import build_text_response_payload
+from .runtime import prepare_session_run, update_session_record
+from .wecom_protocol import build_proactive_text_payload, build_text_response_payload
 
 STATUS_STREAM_INTERVAL_SEC = 2
 _SESSION_RUN_LOCKS: dict[str, asyncio.Lock] = {}
@@ -25,6 +27,19 @@ def extract_codex_stdout_text(stdout: str) -> str:
         if payload.get("type") == "item.completed" and item.get("type") in {"agent_message", "agentmessage"}:
             latest = str(item.get("text") or "").strip() or latest
     return latest
+
+
+def extract_codex_thread_id(stdout: str) -> str | None:
+    for line in str(stdout or "").splitlines():
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if payload.get("type") == "thread.started":
+            thread_id = str(payload.get("thread_id") or "").strip()
+            if thread_id:
+                return thread_id
+    return None
 
 
 def _clear_cached_runtime_payload(runtime, req_id: str, *, final: bool) -> None:
@@ -48,9 +63,15 @@ def _release_session_run_lock(session_id: str, lock: asyncio.Lock) -> None:
 
 
 async def send_or_cache_runtime_payload(runtime, message, session_id: str, content: str, *, final: bool) -> bool:
-    payload = build_text_response_payload(message.req_id, session_id, content, final=final)
+    payload = (
+        build_proactive_text_payload(message.chat_key, content)
+        if final and not message.req_id
+        else build_text_response_payload(message.req_id, session_id, content, final=final)
+    )
     state = get_or_create_reply_state(runtime, message.req_id, session_id, message.chat_key)
     if runtime.ws is None:
+        if final and message.req_id:
+            payload = build_proactive_text_payload(message.chat_key, content)
         cache_reply_payload(state, payload, final=final)
         target = runtime.pending_finals if final else runtime.pending_streams
         if target is not None:
@@ -60,6 +81,8 @@ async def send_or_cache_runtime_payload(runtime, message, session_id: str, conte
         await runtime.ws.send_json(payload)
     except Exception as exc:
         runtime.last_error = str(exc)
+        if final and message.req_id:
+            payload = build_proactive_text_payload(message.chat_key, content)
         cache_reply_payload(state, payload, final=final)
         target = runtime.pending_finals if final else runtime.pending_streams
         if target is not None:
@@ -103,12 +126,37 @@ async def run_text_message_once(config, bot, message, **kwargs):
     try:
         async with session_lock:
             output_file.unlink(missing_ok=True)
-            invocation = build_runner_invocation(launch, prompt=prompt, output_file=output_file, argv_override=kwargs.get("argv_override"))
+            argv_override = kwargs.get("argv_override")
+            launch_thread_id = getattr(launch.session, "thread_id", None)
+            if argv_override is None and launch_thread_id:
+                argv_override = (
+                    "codex",
+                    "exec",
+                    "resume",
+                    "--skip-git-repo-check",
+                    "--json",
+                    "-o",
+                    str(output_file),
+                    launch_thread_id,
+                    "-",
+                )
+            invocation = build_runner_invocation(launch, prompt=prompt, output_file=output_file, argv_override=argv_override)
             result = await asyncio.to_thread(run_invocation, invocation)
             if output_file.exists():
                 reply = output_file.read_text(encoding="utf-8").strip()
             else:
                 reply = extract_codex_stdout_text(result.stdout) or result.stdout.strip()
+            next_thread_id = extract_codex_thread_id(result.stdout) or launch_thread_id
+            update_session_record(
+                bot.runtime_root,
+                launch.session.session_id,
+                lambda current: replace(
+                    current,
+                    updated_at=int(time.time() * 1000),
+                    thread_id=next_thread_id,
+                    last_run_at=int(time.time() * 1000),
+                ),
+            )
     finally:
         _release_session_run_lock(launch.session.session_id, session_lock)
     return launch.session.session_id, reply
@@ -123,8 +171,22 @@ async def stream_text_message_once(config, runtime, message, **kwargs):
     try:
         async with session_lock:
             output_file.unlink(missing_ok=True)
+            argv_override = kwargs.get("argv_override")
+            launch_thread_id = getattr(launch.session, "thread_id", None)
+            if argv_override is None and launch_thread_id:
+                argv_override = (
+                    "codex",
+                    "exec",
+                    "resume",
+                    "--skip-git-repo-check",
+                    "--json",
+                    "-o",
+                    str(output_file),
+                    launch_thread_id,
+                    "-",
+                )
             process = await asyncio.create_subprocess_exec(
-                *(kwargs.get("argv_override") or ("python", "-c", "print('done')")),
+                *(argv_override or ("python", "-c", "print('done')")),
                 cwd=launch.cwd,
                 env=launch.env,
                 stdin=asyncio.subprocess.PIPE,
@@ -169,6 +231,17 @@ async def stream_text_message_once(config, runtime, message, **kwargs):
             if output_file.exists():
                 reply = output_file.read_text(encoding="utf-8").strip()
             reply = reply or text
+            next_thread_id = extract_codex_thread_id(text) or launch_thread_id
+            update_session_record(
+                runtime.config.runtime_root,
+                launch.session.session_id,
+                lambda current: replace(
+                    current,
+                    updated_at=int(time.time() * 1000),
+                    thread_id=next_thread_id,
+                    last_run_at=int(time.time() * 1000),
+                ),
+            )
             await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, reply, final=True)
     finally:
         _release_session_run_lock(launch.session.session_id, session_lock)

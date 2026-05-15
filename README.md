@@ -9,7 +9,7 @@ English overview: [README.en.md](README.en.md)
 - 维护企业微信 WebSocket 长连
 - 管理多 Bot 配置与持久化
 - 为会话启动 `codex exec` / `codex exec resume`
-- 提供会话控制命令 `/bridge-status`、`/bridge-interrupt`、`/bridge-reset`
+- 提供会话控制命令 `/bridge-status`、`/bridge-interrupt`、`/bridge-reset`、`/bridge-resume`
 - 下载企微图片/文件到本地 workspace
 - 通过本地命令或 API 回传文件到企微
 - 支持一次性定时消息和 cron 周期调度
@@ -88,6 +88,13 @@ WECOM_BOT_ENABLED=true
 sh ./start.sh
 ```
 
+说明：
+
+- `start.sh` 默认会先启动仓库内置 watchdog，再由 watchdog 拉起 `bridge.py`
+- watchdog 会定期检查 Bridge 进程和 `GET /` 健康状态
+- 连续失败达到阈值后会自动重启 Bridge，避免单次异常退出后服务一直挂着
+- 如果你明确不需要这层保护，可在 `.env` 中设置 `BRIDGE_WATCHDOG_ENABLED=false`
+
 启动成功后会输出：
 
 - 进程 PID
@@ -146,7 +153,7 @@ Bridge 运行 `codex` 时：
 `groupSessionMode` 支持两种值：
 
 - `per-user`
-  群里不同成员 `@robot` 时，各自隔离会话；回复仍发回原群
+  群里不同成员 `@robot` 时，各自隔离会话；回复仍发回原群，且主动回传的 markdown 消息会自动 `@` 对应触发成员
 - `shared`
   整个群共用一个会话
 
@@ -316,6 +323,7 @@ python3 ./schedule_message.py \
 - `/bridge-status`
 - `/bridge-interrupt`
 - `/bridge-reset`
+- `/bridge-resume`
 
 语义：
 
@@ -325,6 +333,8 @@ python3 ./schedule_message.py \
   中断当前任务，但保留当前 thread 和聊天上下文
 - `/bridge-reset`
   中断当前任务，并清空当前会话上下文
+- `/bridge-resume`
+  列出当前用户可恢复的历史会话；回复编号可选择，或直接发送 `/bridge-resume <sessionId>`
 
 同样的控制能力也可通过 session API 完成：
 
@@ -365,6 +375,31 @@ python3 ./schedule_message.py \
 ```bash
 sh ./check_bridge_health.sh
 ```
+
+### 进程保护
+
+默认启用仓库内置 watchdog，无需额外部署 systemd/supervisor。
+
+关键配置：
+
+- `BRIDGE_WATCHDOG_ENABLED`
+  说明：是否启用 watchdog，默认 `true`
+- `BRIDGE_WATCHDOG_POLL_SEC`
+  说明：watchdog 检查 Bridge 存活和健康状态的周期，默认 `5`
+- `BRIDGE_WATCHDOG_HEALTH_TIMEOUT_SEC`
+  说明：单次健康检查 HTTP 超时时间，默认 `5`
+- `BRIDGE_WATCHDOG_STARTUP_GRACE_SEC`
+  说明：Bridge 启动后的健康检查宽限期，默认 `20`
+- `BRIDGE_WATCHDOG_FAIL_THRESHOLD`
+  说明：连续失败多少次后触发重启，默认 `3`
+- `BRIDGE_WATCHDOG_RESTART_BACKOFF_SEC`
+  说明：重启前的退避等待时间，默认 `3`
+- `BRIDGE_WATCHDOG_RESTART_WINDOW_SEC`
+  说明：统计重启频率的时间窗口，默认 `300`
+- `BRIDGE_WATCHDOG_MAX_RESTART_STREAK`
+  说明：窗口内允许的连续重启上限，默认 `8`
+- `BRIDGE_WATCHDOG_COOLDOWN_SEC`
+  说明：超过重启上限后的冷却时间，默认 `60`
 
 重启噪音检查：
 

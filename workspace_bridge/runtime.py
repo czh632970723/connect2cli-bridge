@@ -87,6 +87,8 @@ def load_session_record(runtime_root: Path | str, session_id: str) -> SessionRec
         roomfile_dir=Path(payload["roomfileDir"]).resolve() if payload.get("roomfileDir") else None,
         created_at=int(payload["createdAt"]),
         updated_at=int(payload["updatedAt"]),
+        thread_id=str(payload.get("threadId") or "").strip() or None,
+        last_run_at=int(payload["lastRunAt"]) if payload.get("lastRunAt") is not None else None,
     )
 
 
@@ -106,9 +108,47 @@ def store_session_record(runtime_root: Path | str, session: SessionRecord) -> Se
             "roomfileDir": str(session.roomfile_dir) if session.roomfile_dir else None,
             "createdAt": session.created_at,
             "updatedAt": session.updated_at,
+            "threadId": session.thread_id,
+            "lastRunAt": session.last_run_at,
         },
     )
     return session
+
+
+def list_session_records(runtime_root: Path | str, bot_id: str) -> list[SessionRecord]:
+    root = session_registry_root(runtime_root)
+    if not root.exists():
+        return []
+    records: list[SessionRecord] = []
+    for session_file in root.glob("*.json"):
+        record = load_session_record(runtime_root, session_file.stem)
+        if record is None or record.bot_id != bot_id:
+            continue
+        records.append(record)
+    records.sort(
+        key=lambda item: (
+            int(item.last_run_at or 0),
+            int(item.updated_at),
+            int(item.created_at),
+            item.session_id,
+        ),
+        reverse=True,
+    )
+    return records
+
+
+def update_session_record(
+    runtime_root: Path | str,
+    session_id: str,
+    updater,
+) -> SessionRecord | None:
+    current = load_session_record(runtime_root, session_id)
+    if current is None:
+        return None
+    next_record = updater(current)
+    if next_record is None:
+        return current
+    return store_session_record(runtime_root, next_record)
 
 
 def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
@@ -136,6 +176,8 @@ def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
             roomfile_dir=runtime_context.roomfile_dir,
             created_at=created_at,
             updated_at=now_ms(),
+            thread_id=current.thread_id if current else None,
+            last_run_at=current.last_run_at if current else None,
         )
         store_session_record(bot.runtime_root, session)
         env = {

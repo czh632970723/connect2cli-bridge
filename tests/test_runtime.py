@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from workspace_bridge.runtime import build_bot_config, load_session_record, prepare_session_run, stable_session_id
+from workspace_bridge.runtime import build_bot_config, list_session_records, load_session_record, prepare_session_run, stable_session_id
 
 
 def write_skill(root: Path, name: str, body: str) -> None:
@@ -98,3 +98,33 @@ def test_prepare_session_run_uses_workspace_skills_over_global(tmp_path: Path) -
     second_launch = prepare_session_run(bot, "single:alice")
 
     assert "deploy" in second_launch.runtime_context.effective_skill_names
+
+
+def test_list_session_records_returns_latest_first_and_preserves_thread_info(tmp_path: Path) -> None:
+    source_dir = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    global_skill_dir = tmp_path / "global-skills"
+    chatfile_root = tmp_path / "chatfiles"
+    source_dir.mkdir()
+    global_skill_dir.mkdir()
+    bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="codex",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        global_skill_dir=global_skill_dir,
+        chatfile_root=chatfile_root,
+    )
+
+    first = prepare_session_run(bot, "single:alice")
+    second = prepare_session_run(bot, "single:bob")
+    from workspace_bridge.runtime import store_session_record
+    from dataclasses import replace
+
+    store_session_record(runtime_root, replace(first.session, thread_id="thread-a", last_run_at=1000, updated_at=1000))
+    store_session_record(runtime_root, replace(second.session, thread_id="thread-b", last_run_at=2000, updated_at=2000))
+
+    records = list_session_records(runtime_root, "bot-1")
+
+    assert [item.session_id for item in records[:2]] == [second.session.session_id, first.session.session_id]
+    assert records[0].thread_id == "thread-b"

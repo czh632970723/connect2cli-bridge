@@ -40,6 +40,8 @@ class WeComBotRuntime:
     active_message_tasks: dict[str, object] = field(default_factory=dict)
     last_error: str | None = None
     last_status: str | None = None
+    resume_candidates: dict[str, list[dict[str, str | int]]] = field(default_factory=dict)
+    resume_selection_expires_at: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,8 @@ class SessionRecord:
     roomfile_dir: Path | None
     created_at: int
     updated_at: int
+    thread_id: str | None = None
+    last_run_at: int | None = None
 
 
 @dataclass(frozen=True)

@@ -17,6 +17,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 START_SH_PATH = REPO_ROOT / "start.sh"
+WATCHDOG_SH_PATH = REPO_ROOT / "bridge_watchdog.sh"
 BRIDGE_RUNTIME_CONFIG_PATH = REPO_ROOT / "bridge_runtime_config.py"
 BRIDGE_ENV_SH_PATH = REPO_ROOT / "bridge_env.sh"
 
@@ -91,6 +92,21 @@ def test_create_session_record_does_not_persist_workdir(bridge_module):
     persisted = bridge_module.read_json_file(bridge_module.get_registry_session_file(record["sessionId"]), None)
     assert persisted is not None
     assert "workDir" not in persisted
+
+
+def test_recycle_session_removes_idle_session_from_memory(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot, "single:test-user")
+
+    bridge_module.recycle_session(bot, sess, "single:test-user")
+
+    assert "single:test-user" not in bot.sessions
+
+
+def test_watchdog_script_no_longer_uses_chunk_ack_queue():
+    content = (REPO_ROOT / "bridge.py").read_text(encoding="utf-8")
+
+    assert "chunk_ack_queue" not in content
 
 
 def test_sanitize_all_session_records_ignores_invalid_records(bridge_module, capsys):
@@ -211,15 +227,116 @@ def test_start_sh_exports_runtime_tuning_envs():
     content = START_SH_PATH.read_text(encoding="utf-8")
 
     assert "load_bridge_runtime_env" in content
-    assert "BRIDGE_BIND" in content
-    assert "LOCAL_FILE_SEND_RESULT_TIMEOUT_MS" in content
-    assert "WEBSOCKET_SEND_TIMEOUT_SEC" in content
-    assert "STATUS_STREAM_INTERVAL_SEC" in content
-    assert "STATUS_SEND_TIMEOUT_SEC" in content
-    assert "STATUS_SEND_LOCK_TIMEOUT_SEC" in content
-    assert "REPLY_IDLE_FALLBACK_SEC" in content
-    assert "REPLY_MAX_AGE_FALLBACK_SEC" in content
-    assert "PROACTIVE_STATUS_INTERVAL_SEC" in content
+    assert "export_bridge_runtime_env" in content
+    assert ".bridge.guard.pid" in content
+
+
+def test_start_sh_cleans_watchdog_on_failed_start():
+    content = START_SH_PATH.read_text(encoding="utf-8")
+
+    assert 'if is_truthy "$BRIDGE_WATCHDOG_ENABLED" && [ -n "$GUARD_PID" ] && kill -0 "$GUARD_PID" 2>/dev/null; then' in content
+    assert 'kill "$GUARD_PID" 2>/dev/null || true' in content
+    assert 'rm -f "$GUARD_PID_FILE"' in content
+
+
+def test_env_example_declares_watchdog_controls():
+    content = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert "BRIDGE_WATCHDOG_ENABLED=true" in content
+    assert "BRIDGE_WATCHDOG_POLL_SEC=5" in content
+    assert "BRIDGE_WATCHDOG_FAIL_THRESHOLD=3" in content
+    assert "BRIDGE_WATCHDOG_COOLDOWN_SEC=60" in content
+
+
+def test_watchdog_script_exists_and_uses_health_probe():
+    content = WATCHDOG_SH_PATH.read_text(encoding="utf-8")
+
+    assert "export_bridge_runtime_env" in content
+    assert "GET /" not in content
+    assert "bridge_health_ok()" in content
+    assert ".bridge.guard.pid" in content
+    assert "restart triggered" in content
+    assert "bridge recovered before restart; skip restart" in content
+    assert 'load_bridge_runtime_env "$SCRIPT_DIR" || exit 1' in content.split("start_bridge_process() {", 1)[1]
+
+
+async def test_main_starts_http_before_runtime_migration_and_bot_loading(bridge_module, monkeypatch):
+    order = []
+
+    class FakeClientSession:
+        def __init__(self, **_kwargs) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class FakeRunner:
+        def __init__(self, app, access_log=None) -> None:
+            self.app = app
+            self.access_log = access_log
+
+        async def setup(self) -> None:
+            order.append("runner.setup")
+
+        async def cleanup(self) -> None:
+            order.append("runner.cleanup")
+            await bridge_module.app_cleanup(self.app)
+
+    class FakeSite:
+        def __init__(self, runner, host, port) -> None:
+            self.runner = runner
+            self.host = host
+            self.port = port
+
+        async def start(self) -> None:
+            order.append("site.start")
+
+    async def wait_for_shutdown() -> None:
+        await bridge_module.SHUTDOWN_EVENT.wait()
+
+    def mark_migration(name: str):
+        def inner() -> None:
+            order.append(name)
+        return inner
+
+    async def fake_load_bots() -> None:
+        order.append("load_bots")
+        bridge_module.SHUTDOWN_EVENT.set()
+
+    async def fake_process_schedule_definitions_once() -> None:
+        order.append("process_schedule_definitions_once")
+
+    async def fake_process_scheduled_messages_once() -> None:
+        order.append("process_scheduled_messages_once")
+
+    async def fake_remove_deleted_bots_from_memory_once() -> None:
+        order.append("remove_deleted_bots_from_memory_once")
+
+    monkeypatch.setattr(bridge_module.aiohttp, "ClientSession", FakeClientSession)
+    monkeypatch.setattr(bridge_module.web, "AppRunner", FakeRunner)
+    monkeypatch.setattr(bridge_module.web, "TCPSite", FakeSite)
+    monkeypatch.setattr(bridge_module, "maybe_migrate_legacy_shared_runtime_state", mark_migration("migrate_shared"))
+    monkeypatch.setattr(bridge_module, "maybe_migrate_legacy_instance_runtime_state", mark_migration("migrate_instance"))
+    monkeypatch.setattr(bridge_module, "sync_project_shared_skills_to_bridge_global", mark_migration("sync_skills"))
+    monkeypatch.setattr(bridge_module, "load_bots", fake_load_bots)
+    monkeypatch.setattr(bridge_module, "process_schedule_definitions_once", fake_process_schedule_definitions_once)
+    monkeypatch.setattr(bridge_module, "process_scheduled_messages_once", fake_process_scheduled_messages_once)
+    monkeypatch.setattr(bridge_module, "remove_deleted_bots_from_memory_once", fake_remove_deleted_bots_from_memory_once)
+    monkeypatch.setattr(bridge_module, "session_recycler_loop", wait_for_shutdown)
+    monkeypatch.setattr(bridge_module, "lease_renew_loop", wait_for_shutdown)
+    monkeypatch.setattr(bridge_module, "local_file_send_loop", wait_for_shutdown)
+    monkeypatch.setattr(bridge_module, "schedule_definition_loop", wait_for_shutdown)
+    monkeypatch.setattr(bridge_module, "scheduled_message_loop", wait_for_shutdown)
+    monkeypatch.setattr(bridge_module, "paused_session_recovery_loop", wait_for_shutdown)
+    monkeypatch.setattr(bridge_module, "bot_config_reconciler_loop", wait_for_shutdown)
+    monkeypatch.setattr(bridge_module, "deleted_bot_reaper_loop", wait_for_shutdown)
+
+    await bridge_module.main()
+
+    assert order.index("site.start") < order.index("migrate_shared")
+    assert order.index("site.start") < order.index("migrate_instance")
+    assert order.index("site.start") < order.index("sync_skills")
+    assert order.index("site.start") < order.index("load_bots")
 
 
 def test_runtime_config_prefers_bridge_bind():
@@ -280,6 +397,43 @@ def test_bridge_env_load_uses_bridge_bind_from_dotenv(tmp_path):
     )
 
     assert result.stdout.strip() == "127.0.0.1 19399"
+
+
+def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (script_dir / ".env").write_text(
+        "BRIDGE_BIND=127.0.0.1:19399\n"
+        "WORK_DIR=/tmp/from-dotenv\n"
+        "BRIDGE_TOKEN=token-from-dotenv\n"
+        "LOCAL_FILE_SEND_POLL_MS=4321\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"; export_bridge_runtime_env; '
+            'python3 -c "import os; print(os.getenv(\'WORK_DIR\')); print(os.getenv(\'BRIDGE_TOKEN\')); print(os.getenv(\'LOCAL_FILE_SEND_POLL_MS\'))"',
+            "sh",
+            str(script_dir),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip().splitlines() == [
+        "/tmp/from-dotenv",
+        "token-from-dotenv",
+        "4321",
+    ]
 
 
 def test_start_bot_invalidates_persisted_threads_when_workdir_changes(bridge_module):
@@ -1711,6 +1865,125 @@ async def test_bridge_interrupt_command_is_intercepted(bridge_module, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_resume_command_lists_candidates_for_current_chat_scope(bridge_module):
+    bot = make_bot(bridge_module)
+    current = make_session(bridge_module, bot, "single:test-user")
+    bridge_module.update_session_record(current.session_id, lambda record: {**record, "threadId": "thread-current", "lastRunAt": bridge_module.now_ms()})
+    other_visible = bridge_module.create_session_record(bot, "group-user:room-1:test-user")
+    bridge_module.update_session_record(
+        other_visible["sessionId"],
+        lambda record: {**record, "threadId": "thread-old", "lastRunAt": bridge_module.now_ms() - 1000},
+    )
+    other_user = bridge_module.create_session_record(bot, "single:someone-else")
+    bridge_module.update_session_record(
+        other_user["sessionId"],
+        lambda record: {**record, "threadId": "thread-hidden", "lastRunAt": bridge_module.now_ms() - 2000},
+    )
+
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        replies.append((req_id, message, final))
+
+    bridge_module.respond_info = fake_respond_info
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-resume"},
+        "body": {
+            "msgtype": "text",
+            "text": {"content": "/bridge-resume"},
+            "from": {"userid": "test-user"},
+        },
+    }
+
+    await bridge_module.handle_wecom_message(bot, payload)
+
+    assert replies
+    content = replies[0][1]
+    assert "可恢复会话" in content
+    assert current.session_id in content
+    assert other_visible["sessionId"] in content
+    assert other_user["sessionId"] not in content
+    assert len(current.resume_candidates) == 2
+
+
+@pytest.mark.asyncio
+async def test_resume_command_binds_selected_thread_to_current_chat(bridge_module):
+    bot = make_bot(bridge_module)
+    current = make_session(bridge_module, bot, "single:test-user")
+    target = bridge_module.create_session_record(bot, "group-user:room-1:test-user")
+    bridge_module.update_session_record(
+        target["sessionId"],
+        lambda record: {**record, "threadId": "thread-target", "lastRunAt": bridge_module.now_ms()},
+    )
+
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        replies.append((req_id, message, final))
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-resume"},
+            "body": {"msgtype": "text", "text": {"content": "/bridge-resume"}, "from": {"userid": "test-user"}},
+        },
+    )
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-select"},
+            "body": {"msgtype": "text", "text": {"content": "1"}, "from": {"userid": "test-user"}},
+        },
+    )
+
+    assert current.thread_id == "thread-target"
+    persisted = bridge_module.read_session_record_by_id(current.session_id)
+    assert persisted["threadId"] == "thread-target"
+    assert current.resume_candidates == []
+    assert "已选择会话" in replies[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_resume_selection_invalid_choice_is_reported(bridge_module):
+    bot = make_bot(bridge_module)
+    current = make_session(bridge_module, bot, "single:test-user")
+    bridge_module.update_session_record(current.session_id, lambda record: {**record, "threadId": "thread-current", "lastRunAt": bridge_module.now_ms()})
+
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        replies.append((req_id, message, final))
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-resume"},
+            "body": {"msgtype": "text", "text": {"content": "/bridge-resume"}, "from": {"userid": "test-user"}},
+        },
+    )
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-select"},
+            "body": {"msgtype": "text", "text": {"content": "99"}, "from": {"userid": "test-user"}},
+        },
+    )
+
+    assert "无效选择" in replies[-1][1]
+    assert current.resume_candidates
+
+
+@pytest.mark.asyncio
 async def test_bridge_status_counts_processing_and_pending_jobs(bridge_module):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
@@ -2100,7 +2373,7 @@ def test_chat_key_for_bot_group_mode_shared_preserves_legacy_behavior(bridge_mod
 
 @pytest.mark.asyncio
 async def test_handle_group_mentions_uses_per_user_session_keys(bridge_module):
-    bot = make_bot(bridge_module)
+    bot = make_bot(bridge_module, name="robot")
     bot.config["groupSessionMode"] = "per-user"
     captured = []
 
@@ -2139,6 +2412,217 @@ async def test_handle_group_mentions_uses_per_user_session_keys(bridge_module):
     assert captured == [
         ("group-user:group-1:user-a", "hello from a", "req-a"),
         ("group-user:group-1:user-b", "hello from b", "req-b"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_group_mentions_supports_bot_name_with_spaces(bridge_module):
+    bot = make_bot(bridge_module, name="Leo C")
+    bot.config["groupSessionMode"] = "per-user"
+    captured = []
+
+    async def fake_enqueue_message(_bot, key, text, req_id, **kwargs):
+        captured.append((key, text, req_id))
+        return True
+
+    bridge_module.enqueue_message = fake_enqueue_message
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-space-name"},
+        "body": {
+            "msgtype": "text",
+            "chattype": "group",
+            "chatid": "group-1",
+            "text": {"content": "@Leo C /bridge-interrupt"},
+            "from": {"userid": "user-a"},
+        },
+    }
+
+    await bridge_module.handle_wecom_message(bot, payload)
+
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_handle_group_message_preserves_bot_name_mention_in_body_text(bridge_module):
+    bot = make_bot(bridge_module, name="Leo C")
+    bot.config["groupSessionMode"] = "per-user"
+    captured = []
+
+    async def fake_enqueue_message(_bot, key, text, req_id, **kwargs):
+        captured.append((key, text, req_id))
+        return True
+
+    bridge_module.enqueue_message = fake_enqueue_message
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-body-mention"},
+        "body": {
+            "msgtype": "text",
+            "chattype": "group",
+            "chatid": "group-1",
+            "text": {"content": "@Leo C 请分析这句话里的 @Leo C 是否会被保留"},
+            "from": {"userid": "user-a"},
+        },
+    }
+
+    await bridge_module.handle_wecom_message(bot, payload)
+
+    assert captured == [
+        ("group-user:group-1:user-a", "请分析这句话里的 @Leo C 是否会被保留", "req-body-mention"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_group_message_does_not_strip_similar_prefix_mention(bridge_module):
+    bot = make_bot(bridge_module, name="bot")
+    bot.config["groupSessionMode"] = "per-user"
+    captured = []
+
+    async def fake_enqueue_message(_bot, key, text, req_id, **kwargs):
+        captured.append((key, text, req_id))
+        return True
+
+    bridge_module.enqueue_message = fake_enqueue_message
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-similar-mention"},
+        "body": {
+            "msgtype": "text",
+            "chattype": "group",
+            "chatid": "group-1",
+            "text": {"content": "@bot2 hello"},
+            "from": {"userid": "user-a"},
+        },
+    }
+
+    await bridge_module.handle_wecom_message(bot, payload)
+
+    assert captured == [
+        ("group-user:group-1:user-a", "@bot2 hello", "req-similar-mention"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_group_message_strips_bot_mention_after_other_mentions(bridge_module):
+    bot = make_bot(bridge_module, name="Leo C")
+    bot.config["groupSessionMode"] = "per-user"
+    captured = []
+
+    async def fake_enqueue_message(_bot, key, text, req_id, **kwargs):
+        captured.append((key, text, req_id))
+        return True
+
+    bridge_module.enqueue_message = fake_enqueue_message
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-other-mentions"},
+        "body": {
+            "msgtype": "text",
+            "chattype": "group",
+            "chatid": "group-1",
+            "text": {"content": "@alice @Leo C hello"},
+            "from": {"userid": "user-a"},
+        },
+    }
+
+    await bridge_module.handle_wecom_message(bot, payload)
+
+    assert captured == [
+        ("group-user:group-1:user-a", "hello", "req-other-mentions"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_group_message_strips_bot_mention_after_spaced_name_mentions(bridge_module):
+    bot = make_bot(bridge_module, name="Leo C")
+    bot.config["groupSessionMode"] = "per-user"
+    captured = []
+
+    async def fake_enqueue_message(_bot, key, text, req_id, **kwargs):
+        captured.append((key, text, req_id))
+        return True
+
+    bridge_module.enqueue_message = fake_enqueue_message
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-spaced-name-mentions"},
+        "body": {
+            "msgtype": "text",
+            "chattype": "group",
+            "chatid": "group-1",
+            "text": {"content": "@Alice Bob @Leo C hello"},
+            "from": {"userid": "user-a"},
+        },
+    }
+
+    await bridge_module.handle_wecom_message(bot, payload)
+
+    assert captured == [
+        ("group-user:group-1:user-a", "hello", "req-spaced-name-mentions"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_group_message_strips_bot_mention_with_punctuation(bridge_module):
+    bot = make_bot(bridge_module, name="robot")
+    bot.config["groupSessionMode"] = "per-user"
+    captured = []
+
+    async def fake_enqueue_message(_bot, key, text, req_id, **kwargs):
+        captured.append((key, text, req_id))
+        return True
+
+    bridge_module.enqueue_message = fake_enqueue_message
+
+    payloads = [
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-comma"},
+            "body": {
+                "msgtype": "text",
+                "chattype": "group",
+                "chatid": "group-1",
+                "text": {"content": "@robot, hello"},
+                "from": {"userid": "user-a"},
+            },
+        },
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-colon"},
+            "body": {
+                "msgtype": "text",
+                "chattype": "group",
+                "chatid": "group-1",
+                "text": {"content": "@robot: hello"},
+                "from": {"userid": "user-a"},
+            },
+        },
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-cn-colon"},
+            "body": {
+                "msgtype": "text",
+                "chattype": "group",
+                "chatid": "group-1",
+                "text": {"content": "@robot：hello"},
+                "from": {"userid": "user-a"},
+            },
+        },
+    ]
+
+    for payload in payloads:
+        await bridge_module.handle_wecom_message(bot, payload)
+
+    assert captured == [
+        ("group-user:group-1:user-a", "hello", "req-comma"),
+        ("group-user:group-1:user-a", "hello", "req-colon"),
+        ("group-user:group-1:user-a", "hello", "req-cn-colon"),
     ]
 
 
@@ -2202,6 +2686,33 @@ def test_chat_key_to_send_target_preserves_group_for_per_user_mode(bridge_module
     chat_type, chat_id = bridge_module.chat_key_to_send_target("group-user:group-1:user-a")
     assert chat_type == 2
     assert chat_id == "group-1"
+
+
+def test_build_proactive_chat_payload_mentions_group_user_by_default(bridge_module):
+    payload = bridge_module.build_proactive_chat_payload("group-user:group-1:user-a", "hello")
+
+    assert payload["body"]["chat_type"] == 2
+    assert payload["body"]["chatid"] == "group-1"
+    assert payload["body"]["markdown"]["content"] == "<@user-a>\nhello"
+
+
+def test_build_proactive_chat_payload_prefers_explicit_mention_user(bridge_module):
+    payload = bridge_module.build_proactive_chat_payload("group-user:group-1:user-a", "hello")
+
+    assert payload["body"]["markdown"]["content"] == "<@user-a>\nhello"
+
+
+def test_build_session_text_payload_mentions_group_user_once_for_direct_reply(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot, "group-user:group-1:user-a")
+    bridge_module.register_reply_session(bot, "req-1", sess)
+
+    first = bridge_module.build_session_text_payload("group-user:group-1:user-a", sess, "req-1", "hello", False)
+    bridge_module.mark_session_reply_sent(bot, sess, first)
+    second = bridge_module.build_session_text_payload("group-user:group-1:user-a", sess, "req-1", "world", False)
+
+    assert first["body"]["stream"]["content"] == "<@user-a>\nhello"
+    assert second["body"]["stream"]["content"] == "world"
 
 
 @pytest.mark.asyncio
@@ -5181,6 +5692,29 @@ async def test_expired_stream_status_uses_proactive_with_interval(bridge_module,
 
 
 @pytest.mark.asyncio
+async def test_expired_stream_status_mentions_group_user_after_max_age(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot, "group-user:group-1:user-a")
+    bot.ws = SimpleNamespace(closed=False)
+    sent_payloads = []
+
+    async def fake_send_ws_payload_with_ack(_bot, payload, _timeout_sec, **kwargs):
+        sent_payloads.append(payload)
+        return {"errcode": 0, "body": {}}
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+    bridge_module.mark_reply_proactive(sess, "req-1")
+    sess.reply_started_at["req-1"] = time.time() - bridge_module.REPLY_MAX_AGE_FALLBACK_SEC - 1
+
+    delivered = await bridge_module.send_session_status(bot, "group-user:group-1:user-a", sess, "req-1", "status 1")
+
+    assert delivered is True
+    assert sent_payloads[0]["cmd"] == "aibot_send_msg"
+    assert sent_payloads[0]["body"]["chatid"] == "group-1"
+    assert sent_payloads[0]["body"]["markdown"]["content"] == "<@user-a>\nstatus 1"
+
+
+@pytest.mark.asyncio
 async def test_send_session_status_closes_stream_before_proactive_after_max_age(bridge_module, monkeypatch):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
@@ -5233,6 +5767,31 @@ async def test_final_reply_after_max_age_falls_back_to_proactive(bridge_module, 
     assert delivered is True
     assert sent_payloads[0]["cmd"] == "aibot_send_msg"
     assert sent_payloads[0]["body"]["markdown"]["content"] == "final"
+    assert "req-1" not in bot.reply_sessions
+
+
+@pytest.mark.asyncio
+async def test_final_reply_after_max_age_mentions_group_user(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot, "group-user:group-1:user-a")
+    bot.ws = SimpleNamespace(closed=False)
+    sent_payloads = []
+
+    async def fake_send_ws_payload_with_ack(_bot, payload, _timeout_sec, **kwargs):
+        sent_payloads.append(payload)
+        return {"errcode": 0, "body": {}}
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+    bridge_module.register_reply_session(bot, "req-1", sess)
+    sess.reply_started_at["req-1"] = time.time() - bridge_module.REPLY_MAX_AGE_FALLBACK_SEC - 1
+
+    payload = bridge_module.build_session_text_payload("group-user:group-1:user-a", sess, "req-1", "final", True)
+    delivered = await bridge_module.send_or_store_session_payload(bot, "group-user:group-1:user-a", sess, payload, True)
+
+    assert delivered is True
+    assert sent_payloads[0]["cmd"] == "aibot_send_msg"
+    assert sent_payloads[0]["body"]["chatid"] == "group-1"
+    assert sent_payloads[0]["body"]["markdown"]["content"] == "<@user-a>\nfinal"
     assert "req-1" not in bot.reply_sessions
 
 
@@ -5457,6 +6016,19 @@ def test_build_codex_home_for_subprocess_preserves_global_skills_and_adds_projec
     assert (codex_home / "skills" / "global-skill" / "SKILL.md").is_file()
     assert (codex_home / "skills" / "project-skill" / "SKILL.md").is_file()
     assert (codex_home / "installation_id").read_text(encoding="utf-8") == "install-1"
+
+
+def test_build_codex_home_for_subprocess_skips_volatile_tmp_arg0_runtime(bridge_module):
+    arg0_dir = bridge_module.DEFAULT_CODEX_HOME / "tmp" / "arg0" / "codex-arg0deadbeef"
+    arg0_dir.mkdir(parents=True, exist_ok=True)
+    (arg0_dir / ".lock").write_text("", encoding="utf-8")
+    (bridge_module.DEFAULT_CODEX_HOME / "installation_id").write_text("install-1", encoding="utf-8")
+
+    codex_home = bridge_module.build_codex_home_for_subprocess("sess-volatile")
+
+    assert (codex_home / "installation_id").read_text(encoding="utf-8") == "install-1"
+    assert (codex_home / "tmp").is_dir()
+    assert not (codex_home / "tmp" / "arg0").exists()
 
 @pytest.mark.asyncio
 async def test_run_codex_retries_fresh_exec_when_stdin_prompt_error_variant_appears(bridge_module, monkeypatch):

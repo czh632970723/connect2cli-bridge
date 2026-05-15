@@ -156,6 +156,8 @@ EXTRA_FILE_ROOTS = [
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\[\?[0-9]*[a-z]")
 TEXT_MENTION_RE = re.compile(r"(?<!\S)@\S+(?:\s+|$)")
+LEADING_MENTION_RE = re.compile(r"^\s*@\S+(?:\s+|$)")
+MENTION_DELIMITER_CHARS = ",:;，。：；"
 CRON_MONTH_NAMES = {
     "JAN": 1,
     "FEB": 2,
@@ -222,6 +224,7 @@ class SessionState:
     reply_last_sent_at: dict[str, float] = field(default_factory=dict)
     reply_proactive_req_ids: set[str] = field(default_factory=set)
     proactive_status_sent_at: dict[str, float] = field(default_factory=dict)
+    reply_mentions_sent: set[str] = field(default_factory=set)
     pending_stream_payload: Optional[dict[str, Any]] = None
     pending_final_payload: Optional[dict[str, Any]] = None
     run_generation: int = 0
@@ -230,6 +233,8 @@ class SessionState:
     active_schedule_request_id: Optional[str] = None
     interrupt_requested: bool = False
     active_schedule_id: Optional[str] = None
+    resume_candidates: list[dict[str, Any]] = field(default_factory=list)
+    resume_selection_expires_at: int = 0
 
 
 @dataclass
@@ -247,7 +252,6 @@ class BotState:
     upload_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     pending_requests: dict[str, asyncio.Future] = field(default_factory=dict)
     reply_sessions: dict[str, SessionState] = field(default_factory=dict)
-    chunk_ack_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     active_local_file_request_ids: set[str] = field(default_factory=set)
     cancelled_local_file_request_ids: set[str] = field(default_factory=set)
     active_upload_task: Optional[asyncio.Task] = None
@@ -1564,8 +1568,23 @@ def message_sender_userid(message: dict[str, Any]) -> str:
     return str(((body.get("from") or {}).get("userid")) or "unknown")
 
 
-def strip_text_mentions(content: str) -> str:
-    return TEXT_MENTION_RE.sub("", content or "").strip()
+def strip_text_mentions(content: str, bot_name: Optional[str] = None) -> str:
+    text = content or ""
+    normalized_bot_name = str(bot_name or "").strip()
+    if not normalized_bot_name:
+        return LEADING_MENTION_RE.sub("", text, count=1).strip()
+    cursor = text.lstrip()
+    bot_pattern = re.compile(rf"@{re.escape(normalized_bot_name)}(?P<suffix>\s+|[{re.escape(MENTION_DELIMITER_CHARS)}]|$)")
+    leading_mentions_pattern = re.compile(r"^(?:@[^@\n]+?\s+)*$")
+    for bot_match in bot_pattern.finditer(cursor):
+        start = bot_match.start()
+        if start > 0 and not cursor[start - 1].isspace():
+            continue
+        prefix = cursor[:start]
+        if prefix and not leading_mentions_pattern.fullmatch(prefix):
+            continue
+        return cursor[bot_match.end() :].lstrip().strip()
+    return text.strip()
 
 
 def chat_key_for_bot(bot: BotState, message: dict[str, Any]) -> str:
@@ -1741,6 +1760,7 @@ def cleanup_reply_session(bot: BotState, req_id: Optional[str], sess: Optional[S
         context.reply_last_sent_at.pop(req_id, None)
         context.reply_proactive_req_ids.discard(req_id)
         context.proactive_status_sent_at.pop(req_id, None)
+        context.reply_mentions_sent.discard(req_id)
     bot.reply_sessions.pop(req_id, None)
 
 
@@ -1750,11 +1770,22 @@ def cleanup_session_reply_contexts(bot: BotState, sess: SessionState) -> None:
             cleanup_reply_session(bot, req_id, sess)
 
 
+def key_for_session(bot: BotState, sess: SessionState) -> str:
+    for key, context in bot.sessions.items():
+        if context is sess:
+            return key
+    return ""
+
+
 def mark_session_reply_sent(bot: BotState, sess: Optional[SessionState], payload: dict[str, Any]) -> None:
     if not sess or not is_reply_payload(payload):
         return
     req_id = payload_req_id(payload)
     sess.reply_last_sent_at[req_id] = time.time()
+    if req_id and key_for_session(bot, sess).startswith("group-user:"):
+        mention = format_group_user_mention(chat_key_to_user_id(key_for_session(bot, sess)))
+        if mention and reply_payload_content(payload).startswith(mention):
+            sess.reply_mentions_sent.add(req_id)
     if reply_payload_finished(payload):
         cleanup_reply_session(bot, req_id, sess)
 
@@ -1880,8 +1911,55 @@ def limit_proactive_text(content: str) -> str:
     return text[: max(0, PROACTIVE_TEXT_MAX_CHARS - len(suffix))].rstrip() + suffix
 
 
-def build_proactive_chat_payload(key: str, content: str) -> dict[str, Any]:
+def format_group_user_mention(user_id: Optional[str]) -> str:
+    text = str(user_id or "").strip()
+    if not text:
+        return ""
+    return f"<@{text}>"
+
+
+def prepend_group_user_mention(content: str, user_id: Optional[str]) -> str:
+    mention = format_group_user_mention(user_id)
+    text = content.strip()
+    if not mention:
+        return text
+    if text.startswith(mention):
+        return text
+    if not text:
+        return mention
+    return f"{mention}\n{text}"
+
+
+def should_prepend_group_user_mention_to_reply(key: str, sess: SessionState, req_id: Optional[str]) -> bool:
+    if not req_id or not key.startswith("group-user:"):
+        return False
+    if req_id in sess.reply_proactive_req_ids:
+        return False
+    if req_id in sess.reply_mentions_sent:
+        return False
+    return True
+
+
+def proactive_reply_mention_user_id(key: str, sess: SessionState, req_id: Optional[str]) -> Optional[str]:
+    if not req_id or not key.startswith("group-user:"):
+        return None
+    if not reply_age_too_long(sess, req_id):
+        return None
+    return chat_key_to_user_id(key)
+
+
+def proactive_chat_mention_user_id(key: str, mention_user_id: Optional[str] = None) -> Optional[str]:
+    explicit = str(mention_user_id or "").strip()
+    if explicit:
+        return explicit
+    if key.startswith("group-user:"):
+        return chat_key_to_user_id(key)
+    return None
+
+
+def build_proactive_chat_payload(key: str, content: str, mention_user_id: Optional[str] = None) -> dict[str, Any]:
     chat_type, chat_id = chat_key_to_send_target(key)
+    resolved_mention_user_id = proactive_chat_mention_user_id(key, mention_user_id)
     return {
         "cmd": "aibot_send_msg",
         "headers": {"req_id": uid()},
@@ -1889,7 +1967,7 @@ def build_proactive_chat_payload(key: str, content: str) -> dict[str, Any]:
             "chatid": chat_id,
             "chat_type": chat_type,
             "msgtype": "markdown",
-            "markdown": {"content": limit_proactive_text(content)},
+            "markdown": {"content": limit_proactive_text(prepend_group_user_mention(content, resolved_mention_user_id))},
         },
     }
 
@@ -1921,10 +1999,13 @@ async def send_ws_payload_with_ack(
 
 def build_session_text_payload(key: str, sess: SessionState, req_id: Optional[str], content: str, final: bool) -> Optional[dict[str, Any]]:
     if req_id:
+        stream_content = content
+        if should_prepend_group_user_mention_to_reply(key, sess, req_id):
+            stream_content = prepend_group_user_mention(content, chat_key_to_user_id(key))
         return {
             "cmd": "aibot_respond_msg",
             "headers": {"req_id": req_id},
-            "body": {"msgtype": "stream", "stream": {"id": sess.session_id, "finish": final, "content": content}},
+            "body": {"msgtype": "stream", "stream": {"id": sess.session_id, "finish": final, "content": stream_content}},
         }
     if not final:
         return None
@@ -2011,7 +2092,11 @@ async def send_or_store_session_payload(
             return False
         if reply_req_id and final and (reply_idle_too_long(sess, reply_req_id) or reply_should_use_proactive(sess, reply_req_id)):
             mark_reply_proactive(sess, reply_req_id)
-            outgoing_payload = build_proactive_chat_payload(key, reply_payload_content(outgoing_payload))
+            outgoing_payload = build_proactive_chat_payload(
+                key,
+                reply_payload_content(outgoing_payload),
+                proactive_reply_mention_user_id(key, sess, reply_req_id),
+            )
     req_id = payload_req_id(outgoing_payload)
     payload_kind = "final" if final else "stream"
     requires_ack = outgoing_payload.get("cmd") == "aibot_send_msg" and bool(req_id)
@@ -2834,6 +2919,7 @@ def recycle_session(bot: BotState, sess: SessionState, key: str) -> None:
     cleanup_session_reply_contexts(bot, sess)
     release_session_lease(bot, key, sess)
     update_session_record(sess.session_id, lambda record: {**record, "status": "idle", "activeScheduleId": None})
+    bot.sessions.pop(key, None)
 
 
 def interrupt_session(
@@ -2928,6 +3014,7 @@ async def reset_session_command(bot: BotState, key: str, req_id: Optional[str]) 
     sess = bot.sessions.get(key)
     control_session(bot, key, clear_thread=True, clear_chat=True)
     if sess:
+        clear_resume_selection(sess)
         register_reply_session(bot, req_id, sess)
     await respond_info(bot, req_id, "Session reset.")
 
@@ -2936,6 +3023,7 @@ async def interrupt_session_command(bot: BotState, key: str, req_id: Optional[st
     sess = bot.sessions.get(key)
     control_session(bot, key, clear_thread=False, clear_chat=False)
     if sess:
+        clear_resume_selection(sess)
         register_reply_session(bot, req_id, sess)
     await respond_info(bot, req_id, "Current task interrupted.")
     if sess:
@@ -2954,6 +3042,216 @@ def count_scheduled_messages_for_key(bot_id: str, key: str) -> int:
             ):
                 total += 1
     return total
+
+
+RESUME_SELECTION_TTL_MS = 5 * 60 * 1000
+
+
+def session_records_for_bot(bot_id: str) -> list[dict[str, Any]]:
+    sessions_root = SESSION_REGISTRY_ROOT / "sessions"
+    if not sessions_root.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for session_file in sessions_root.glob("*.json"):
+        record = normalize_session_record(read_json_file(session_file, None))
+        if not record:
+            continue
+        if str(record.get("botId") or "") != bot_id:
+            continue
+        records.append(record)
+    records.sort(
+        key=lambda item: (
+            int(item.get("lastRunAt") or 0),
+            int(item.get("updatedAt") or 0),
+            int(item.get("createdAt") or 0),
+            str(item["sessionId"]),
+        ),
+        reverse=True,
+    )
+    return records
+
+
+def resume_record_is_visible_to_chat(target_key: str, current_key: str) -> bool:
+    if target_key == current_key:
+        return True
+    target_user_id = chat_key_to_user_id(target_key)
+    current_user_id = chat_key_to_user_id(current_key)
+    if target_user_id and current_user_id:
+        return target_user_id == current_user_id
+    if target_key.startswith("group:") and current_key.startswith("group:"):
+        return chat_key_to_room_id(target_key) == chat_key_to_room_id(current_key)
+    return False
+
+
+def build_resume_candidates(bot: BotState, key: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen_session_ids: set[str] = set()
+    for record in session_records_for_bot(bot.config["id"]):
+        session_id = str(record["sessionId"])
+        thread_id = str(record.get("threadId") or "").strip()
+        candidate_key = str(record.get("chatKey") or "").strip()
+        if not thread_id or not candidate_key or session_id in seen_session_ids:
+            continue
+        if not resume_record_is_visible_to_chat(candidate_key, key):
+            continue
+        seen_session_ids.add(session_id)
+        candidates.append(
+            {
+                "sessionId": session_id,
+                "threadId": thread_id,
+                "chatKey": candidate_key,
+                "updatedAt": int(record.get("updatedAt") or record.get("createdAt") or 0),
+                "lastRunAt": int(record.get("lastRunAt") or 0),
+                "status": str(record.get("status") or "idle"),
+            }
+        )
+    return candidates
+
+
+def format_resume_candidate_line(index: int, candidate: dict[str, Any]) -> str:
+    ts = int(candidate.get("lastRunAt") or candidate.get("updatedAt") or 0)
+    ts_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts / 1000)) if ts > 0 else "-"
+    status = str(candidate.get("status") or "idle")
+    return f"{index}. {candidate['sessionId']}  {ts_text}  status={status}  chatKey={candidate['chatKey']}"
+
+
+def build_resume_candidates_message(candidates: list[dict[str, Any]]) -> str:
+    lines = ["检测到以下可恢复会话，请回复编号或直接回复 /bridge-resume <sessionId>："]
+    for index, candidate in enumerate(candidates, start=1):
+        lines.append(format_resume_candidate_line(index, candidate))
+    lines.append("回复“取消”可退出恢复选择。")
+    return "\n".join(lines)
+
+
+def clear_resume_selection(sess: SessionState) -> None:
+    sess.resume_candidates.clear()
+    sess.resume_selection_expires_at = 0
+
+
+def resume_selection_active(sess: SessionState) -> bool:
+    if not sess.resume_candidates:
+        return False
+    if sess.resume_selection_expires_at <= now_ms():
+        clear_resume_selection(sess)
+        return False
+    return True
+
+
+def select_resume_candidate(sess: SessionState, token: str) -> Optional[dict[str, Any]]:
+    text = str(token or "").strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d+", text):
+        index = int(text)
+        if 1 <= index <= len(sess.resume_candidates):
+            return sess.resume_candidates[index - 1]
+        return None
+    for candidate in sess.resume_candidates:
+        if text == str(candidate.get("sessionId") or "").strip():
+            return candidate
+    return None
+
+
+def bind_resume_candidate_to_session(
+    bot: BotState,
+    sess: SessionState,
+    key: str,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    thread_id = str(candidate.get("threadId") or "").strip()
+    if not thread_id:
+        raise BridgeError(404, "selected session is no longer resumable")
+    target_record = read_session_record_by_id(str(candidate["sessionId"]))
+    if not target_record:
+        raise BridgeError(404, f"session not found: {candidate['sessionId']}")
+    target_thread_id = str(target_record.get("threadId") or "").strip()
+    if not target_thread_id:
+        raise BridgeError(404, "selected session no longer has a resumable thread")
+    sess.thread_id = target_thread_id
+    update_session_record(
+        sess.session_id,
+        lambda record: {
+            **record,
+            "threadId": target_thread_id,
+            "lastRunAt": now_ms(),
+        },
+    )
+    clear_resume_selection(sess)
+    add_log(
+        bot,
+        f"[{key}] bound resume thread from session={target_record['sessionId']} chatKey={target_record['chatKey']}",
+    )
+    return {
+        "sourceSessionId": target_record["sessionId"],
+        "sourceChatKey": target_record["chatKey"],
+        "threadId": target_thread_id,
+    }
+
+
+async def start_resume_selection_command(bot: BotState, key: str, req_id: Optional[str]) -> None:
+    sess = get_or_create_session(bot, key)
+    candidates = build_resume_candidates(bot, key)
+    if not candidates:
+        clear_resume_selection(sess)
+        register_reply_session(bot, req_id, sess)
+        await respond_info(bot, req_id, "没有可恢复的会话。")
+        return
+    sess.resume_candidates = candidates
+    sess.resume_selection_expires_at = now_ms() + RESUME_SELECTION_TTL_MS
+    register_reply_session(bot, req_id, sess)
+    await respond_info(bot, req_id, build_resume_candidates_message(candidates))
+
+
+async def apply_resume_selection_command(
+    bot: BotState,
+    key: str,
+    req_id: Optional[str],
+    token: str,
+) -> bool:
+    sess = get_or_create_session(bot, key)
+    if not resume_selection_active(sess):
+        clear_resume_selection(sess)
+        return False
+    text = str(token or "").strip()
+    if text in {"取消", "cancel", "Cancel", "CANCEL"}:
+        clear_resume_selection(sess)
+        register_reply_session(bot, req_id, sess)
+        await respond_info(bot, req_id, "已取消恢复选择。")
+        return True
+    candidate = select_resume_candidate(sess, text)
+    if not candidate:
+        register_reply_session(bot, req_id, sess)
+        await respond_info(bot, req_id, "无效选择，请回复列表编号、sessionId，或回复“取消”。")
+        return True
+    bound = bind_resume_candidate_to_session(bot, sess, key, candidate)
+    register_reply_session(bot, req_id, sess)
+    await respond_info(
+        bot,
+        req_id,
+        f"已选择会话 {bound['sourceSessionId']}，接下来会继续该上下文。",
+    )
+    return True
+
+
+async def resume_session_command(bot: BotState, key: str, req_id: Optional[str], session_id: str) -> None:
+    sess = get_or_create_session(bot, key)
+    record = read_session_record_by_id(session_id)
+    if not record:
+        raise BridgeError(404, f"session not found: {session_id}")
+    candidate_key = str(record.get("chatKey") or "").strip()
+    if not resume_record_is_visible_to_chat(candidate_key, key):
+        raise BridgeError(403, "session is not resumable from current chat")
+    candidate = {
+        "sessionId": record["sessionId"],
+        "chatKey": candidate_key,
+        "threadId": str(record.get("threadId") or "").strip(),
+        "updatedAt": int(record.get("updatedAt") or record.get("createdAt") or 0),
+        "lastRunAt": int(record.get("lastRunAt") or 0),
+        "status": str(record.get("status") or "idle"),
+    }
+    bound = bind_resume_candidate_to_session(bot, sess, key, candidate)
+    register_reply_session(bot, req_id, sess)
+    await respond_info(bot, req_id, f"已选择会话 {bound['sourceSessionId']}，接下来会继续该上下文。")
 
 
 async def status_session_command(bot: BotState, key: str, req_id: Optional[str]) -> None:
@@ -5211,7 +5509,9 @@ def build_codex_home_for_subprocess(session_id: str) -> Path:
 
     if base_home.exists():
         for child in sorted(base_home.iterdir(), key=lambda item: item.name):
-            if child.name in {"skills", "sessions"}:
+            # Skip volatile runtime trees. They are recreated per session and may
+            # contain short-lived sandbox binaries that disappear while copying.
+            if child.name in {"skills", "sessions", "tmp"}:
                 continue
             destination = bridge_home / child.name
             if child.is_dir():
@@ -5427,12 +5727,17 @@ async def stop_bot(bot_id: str, persist_disable: bool = True, persist_state: boo
     release_bot_runtime_lock(bot)
     reject_pending_requests(bot, "bot websocket closed")
     session_run_tasks: list[asyncio.Task] = []
+    session_processes: list[asyncio.subprocess.Process] = []
     for key, sess in list(bot.sessions.items()):
         if sess.run_task and not sess.run_task.done():
             session_run_tasks.append(sess.run_task)
+        if sess.proc and sess.proc.returncode is None:
+            session_processes.append(sess.proc)
         interrupt_session(bot, key, sess, clear_thread=False, clear_chat=False, clear_queue=True)
     for task in session_run_tasks:
         await cancel_task(task)
+    for process in session_processes:
+        await terminate_process(process)
     bot.sessions.clear()
     bot.status = "stopped"
     if persist_state and not bot_instance_is_stale(bot):
@@ -5462,9 +5767,7 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
 
     if message.get("errcode") is not None and not message.get("cmd"):
         body = message.get("body") or {}
-        if message.get("errcode") == 0 and not body.get("upload_id") and not body.get("media_id"):
-            bot.chunk_ack_queue.put_nowait(message)
-        elif message.get("errcode") != 0:
+        if message.get("errcode") != 0:
             add_log(bot, f"WeCom response error: {message.get('errcode')} {message.get('errmsg', '')}")
         return
 
@@ -5483,10 +5786,16 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
     msg_type = body.get("msgtype")
 
     if command == "aibot_msg_callback" and msg_type == "text":
-        content = strip_text_mentions(((body.get("text") or {}).get("content") or ""))
+        content = strip_text_mentions(((body.get("text") or {}).get("content") or ""), bot.config.get("name"))
         key = chat_key_for_bot(bot, message)
         add_log(bot, f'recv: "{content}" {key}')
         try:
+            if content == "/bridge-resume":
+                await start_resume_selection_command(bot, key, req_id)
+                return
+            if content.startswith("/bridge-resume "):
+                await resume_session_command(bot, key, req_id, content.split(None, 1)[1].strip())
+                return
             if content == "/bridge-interrupt":
                 await interrupt_session_command(bot, key, req_id)
                 return
@@ -5495,6 +5804,9 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
                 return
             if content == "/bridge-status":
                 await status_session_command(bot, key, req_id)
+                return
+            current_sess = bot.sessions.get(key)
+            if current_sess and await apply_resume_selection_command(bot, key, req_id, content):
                 return
         except BridgeError as exc:
             await respond_info(bot, req_id, f"Bridge command failed: {exc.message}")
@@ -6353,15 +6665,27 @@ async def main() -> None:
     ensure_dir(USER_ALIAS_ROOT)
     ensure_dir(get_bridge_codex_home_root())
     ensure_dir(get_bridge_global_skills_root())
-    maybe_migrate_legacy_shared_runtime_state()
-    maybe_migrate_legacy_instance_runtime_state()
-    sync_project_shared_skills_to_bridge_global()
     if not DATA_FILE.exists():
         write_json_atomic(DATA_FILE, [])
-    sanitize_all_session_records()
 
     HTTP_SESSION = aiohttp.ClientSession(trust_env=True)
     CODEX_RUN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_CODEX_RUNS)
+
+    app = build_app()
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, HOST, PORT)
+    await site.start()
+
+    print_log(f"WeCom Codex Bridge Python: {BRIDGE_API_BASE}")
+    print_log(f"[SECURITY] API access: {api_auth_mode_label()}")
+    print_log(f"[CODEX] exec mode: {CODEX_EXEC_MODE}")
+    print_log(f"[CODEX] max concurrent runs: {MAX_CONCURRENT_CODEX_RUNS}")
+
+    maybe_migrate_legacy_shared_runtime_state()
+    maybe_migrate_legacy_instance_runtime_state()
+    sync_project_shared_skills_to_bridge_global()
+    sanitize_all_session_records()
 
     await load_bots()
 
@@ -6377,17 +6701,6 @@ async def main() -> None:
     await process_schedule_definitions_once()
     await process_scheduled_messages_once()
     await remove_deleted_bots_from_memory_once()
-
-    app = build_app()
-    runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
-    site = web.TCPSite(runner, HOST, PORT)
-    await site.start()
-
-    print_log(f"WeCom Codex Bridge Python: {BRIDGE_API_BASE}")
-    print_log(f"[SECURITY] API access: {api_auth_mode_label()}")
-    print_log(f"[CODEX] exec mode: {CODEX_EXEC_MODE}")
-    print_log(f"[CODEX] max concurrent runs: {MAX_CONCURRENT_CODEX_RUNS}")
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

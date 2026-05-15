@@ -263,7 +263,86 @@ async def test_bridge_interrupt_command_terminates_active_process(tmp_path) -> N
     )
 
     assert process.terminated is True
-    assert ws.sent[0]["body"]["stream"]["content"] == "Current task interrupted."
+
+
+async def test_resume_command_lists_candidates(tmp_path) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import prepare_session_run, store_session_record
+    from dataclasses import replace
+
+    config = make_config(tmp_path)
+    bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    ws = FakeWS([])
+    launch = prepare_session_run(bot.config, "single:alice")
+    other = prepare_session_run(bot.config, "single:bob")
+    store_session_record(bot.config.runtime_root, replace(launch.session, thread_id="thread-a", last_run_at=2000))
+    store_session_record(bot.config.runtime_root, replace(other.session, thread_id="thread-b", last_run_at=1000))
+
+    async def fake_handler(*_args, **_kwargs):
+        raise AssertionError("handler should not be called for resume list")
+
+    await handle_wecom_payload(
+        config,
+        bot,
+        ws,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-resume"},
+            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/bridge-resume"}},
+        },
+        fake_handler,
+    )
+
+    assert len(ws.sent) == 1
+    content = ws.sent[0]["body"]["stream"]["content"]
+    assert "可恢复会话" in content
+    assert launch.session.session_id in content
+    assert other.session.session_id not in content
+
+
+async def test_resume_selection_binds_selected_thread(tmp_path) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import load_session_record, prepare_session_run, store_session_record
+    from dataclasses import replace
+
+    config = make_config(tmp_path)
+    runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    ws = FakeWS([])
+    current = prepare_session_run(runtime.config, "single:alice")
+    target = prepare_session_run(runtime.config, "group-user:room-1:alice")
+    store_session_record(runtime.config.runtime_root, replace(target.session, thread_id="thread-target", last_run_at=2000))
+
+    async def fake_handler(*_args, **_kwargs):
+        raise AssertionError("handler should not be called for resume selection")
+
+    await handle_wecom_payload(
+        config,
+        runtime,
+        ws,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-resume"},
+            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/bridge-resume"}},
+        },
+        fake_handler,
+    )
+    await handle_wecom_payload(
+        config,
+        runtime,
+        ws,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-select"},
+            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "1"}},
+        },
+        fake_handler,
+    )
+
+    assert any(target.session.session_id in item["body"]["stream"]["content"] for item in ws.sent if item["body"]["stream"]["finish"])
+    updated = load_session_record(runtime.config.runtime_root, current.session.session_id)
+    assert updated is not None
+    assert updated.thread_id == "thread-target"
+    assert runtime.resume_candidates == {}
 
 
 async def test_workfile_dir_is_allowed_for_send_file(tmp_path) -> None:

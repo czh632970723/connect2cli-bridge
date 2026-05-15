@@ -212,6 +212,24 @@ async def test_send_or_cache_runtime_payload_uses_reply_state_cache_for_req_id(t
     assert runtime.reply_states["req-1"].pending_stream_payload is not None
 
 
+async def test_send_or_cache_runtime_payload_uses_proactive_group_markdown_for_final_fallback(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.execution import send_or_cache_runtime_payload
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    message = WeComTextMessage(req_id="req-1", chat_key="group-user:room-1:alice", content="hello", raw_payload={})
+
+    delivered = await send_or_cache_runtime_payload(runtime, message, "session-1", "final", final=True)
+
+    assert delivered is False
+    assert "req-1" in runtime.pending_finals
+    assert runtime.pending_finals["req-1"]["cmd"] == "aibot_send_msg"
+    assert runtime.pending_finals["req-1"]["body"]["markdown"]["content"] == "<@alice>\nfinal"
+    assert runtime.reply_states["req-1"].pending_final_payload is not None
+
+
 async def test_send_or_cache_runtime_payload_falls_back_to_cache_on_send_error(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.config import build_bot_from_app_config
@@ -288,6 +306,44 @@ async def test_run_text_message_once_prefers_output_file_text_over_json_stdout(t
 
     assert session_id == "session-1"
     assert reply == "final from output file"
+
+
+async def test_run_text_message_once_persists_thread_id_from_stdout(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import load_session_record
+
+    bot = build_bot_from_app_config(config)
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    original_run_invocation = execution_module.run_invocation
+
+    def fake_run_invocation(_invocation):
+        return SimpleNamespace(
+            returncode=0,
+            stdout="\n".join(
+                [
+                    json.dumps({"type": "thread.started", "thread_id": "thread-123"}, ensure_ascii=False),
+                    json.dumps({"type": "item.completed", "item": {"type": "agentmessage", "text": "done"}}, ensure_ascii=False),
+                ]
+            ),
+            stderr="",
+        )
+
+    execution_module.run_invocation = fake_run_invocation
+    try:
+        session_id, reply = await run_text_message_once(
+            config,
+            bot,
+            message,
+            argv_override=("python", "-c", "print('unused')"),
+        )
+    finally:
+        execution_module.run_invocation = original_run_invocation
+
+    stored = load_session_record(bot.runtime_root, session_id)
+    assert reply == "done"
+    assert stored is not None
+    assert stored.thread_id == "thread-123"
 
 
 async def test_stream_text_message_once_uses_json_stdout_when_output_file_missing(tmp_path: Path) -> None:
